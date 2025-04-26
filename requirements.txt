@@ -139,7 +139,6 @@ mdurl==0.1.2
 mistune==3.1.2
 monotonic==1.6
 mpmath==1.3.0
--e git+https://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@github.com/ishanyash/streamlit-candidates-dashboard.git@98a530dcc9caf2e96de6df162c5e2b913f146968#egg=multi_agent_scraper&subdirectory=ai_web_crawler
 multidict==6.1.0
 multiprocess==0.70.16
 mypy-extensions==1.0.0
