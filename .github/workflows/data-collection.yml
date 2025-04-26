@@ -1,0 +1,54 @@
+name: BTR Data Collection
+
+on:
+  # Schedule based on frequency
+  schedule:
+    # Choose one of these based on your preference:
+    - cron: '0 * * * *'    # Hourly (at minute 0)
+    # - cron: '0 2 * * *'    # Daily (at 2 AM UTC)
+    # - cron: '0 2 * * 1'    # Weekly (Monday at 2 AM UTC)
+    # - cron: '0 2 1 * *'    # Monthly (1st day at 2 AM UTC)
+  
+  # Also allow manual triggers
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'Run mode'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - test
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Run data collection
+        env:
+          EPC_API_KEY: ${{ secrets.EPC_API_KEY }}
+          DATA_COLLECTION_FREQUENCY: ${{ secrets.DATA_COLLECTION_FREQUENCY }}
+        run: |
+          python scripts/run_data_collection.py --run-now
+          
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: processed-data
+          path: data/processed/
+          retention-days: 7
