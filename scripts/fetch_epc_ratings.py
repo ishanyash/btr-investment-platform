@@ -37,7 +37,9 @@ def fetch_epc_ratings(output_dir='data/raw', sample_size=None):
             logger.info("EPC API key not found. Using fallback bulk data method.")
             
             # This is the publicly available bulk data
-            bulk_url = "https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/904503/D_EPC_National_Certificates_2020_Q2.zip"
+            current_year = datetime.now().year
+            current_quarter = (datetime.now().month - 1) // 3 + 1
+            bulk_url = f"https://epc.opendatacommunities.org/api/v1/domestic/search?size=10000"
             
             logger.info(f"Downloading bulk EPC data from {bulk_url}")
             response = requests.get(bulk_url, stream=True)
