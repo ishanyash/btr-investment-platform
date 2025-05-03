@@ -9,7 +9,7 @@ from .investment_calculator_page import display_investment_calculator
 
 # src/utils/__init__.py
 # Import utility functions for easy access
-from .data_processor import (
+from ..utils.data_processor import (
     load_land_registry_data,
     load_ons_rental_data,
     load_planning_data,
