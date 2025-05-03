@@ -14,6 +14,7 @@ from src.components.data_dashboard import display_data_dashboard
 from src.components.investment_calculator_page import display_investment_calculator
 from src.components.mapping_util import display_btr_map
 from src.components.recommendations_page import display_recommendations
+from src.components.btr_report_generator import display_btr_report_generator
 
 st.set_page_config(
     page_title="BTR Investment Platform",
@@ -22,17 +23,33 @@ st.set_page_config(
 )
 
 def main():
-    st.title("UK BTR Investment Platform")
+    # Check for URL parameters to allow direct access to specific pages
+    query_params = st.experimental_get_query_params()
+    default_page = "BTR Report Generator"  # Make the report generator the default
     
-    # Add sidebar navigation
+    if "page" in query_params:
+        page_from_url = query_params["page"][0]
+        if page_from_url in ["BTR Report Generator", "Home", "BTR Hotspot Map", 
+                             "Investment Calculator", "Recommendations", "Data Explorer"]:
+            default_page = page_from_url
+    
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Select a page",
-        ["Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"]
+        ["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"],
+        index=["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"].index(default_page)
+    )
+
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Select a page",
+        ["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"]
     )
     
     # Simple routing
-    if page == "Home":
+    if page == "BTR Report Generator":
+        display_btr_report_generator()
+    elif page == "Home":
         display_home()
     elif page == "BTR Hotspot Map":
         display_btr_map()
@@ -45,7 +62,56 @@ def main():
 
 
 def display_home():
-    """Display the home page"""
+    st.markdown("""
+    <style>
+    .cta-container {
+        padding: 30px;
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        text-align: center;
+        margin-bottom: 30px;
+        border: 2px solid #4CAF50;
+    }
+    .cta-title {
+        color: #4CAF50;
+        font-size: 2.5rem;
+        margin-bottom: 20px;
+    }
+    .cta-description {
+        font-size: 1.2rem;
+        margin-bottom: 20px;
+    }
+    .cta-button {
+        background-color: #4CAF50;
+        color: white;
+        padding: 12px 30px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 1.1rem;
+        font-weight: 600;
+        text-decoration: none;
+        display: inline-block;
+        margin-top: 10px;
+    }
+    .cta-button:hover {
+        background-color: #45a049;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Create a large call-to-action for the BTR Report Generator
+    st.markdown("""
+    <div class="cta-container">
+        <h1 class="cta-title">Generate a BTR Investment Report</h1>
+        <p class="cta-description">Enter any UK property address to get an instant Buy-to-Rent investment analysis with renovation scenarios and profit projections.</p>
+        <a href="?page=BTR+Report+Generator" target="_self">
+            <button class="cta-button">
+                Generate Report Now
+            </button>
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
     st.write("## Welcome to the BTR Investment Platform")
     
     # Display key metrics from Knight Frank reports
