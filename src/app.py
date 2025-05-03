@@ -24,11 +24,11 @@ st.set_page_config(
 
 def main():
     # Check for URL parameters to allow direct access to specific pages
-    query_params = st.experimental_get_query_params()
+    query_params = st.query_params
     default_page = "BTR Report Generator"  # Make the report generator the default
     
     if "page" in query_params:
-        page_from_url = query_params["page"][0]
+        page_from_url = query_params["page"]
         if page_from_url in ["BTR Report Generator", "Home", "BTR Hotspot Map", 
                              "Investment Calculator", "Recommendations", "Data Explorer"]:
             default_page = page_from_url
@@ -37,13 +37,8 @@ def main():
     page = st.sidebar.radio(
         "Select a page",
         ["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"],
-        index=["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"].index(default_page)
-    )
-
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Select a page",
-        ["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"]
+        index=["BTR Report Generator", "Home", "BTR Hotspot Map", "Investment Calculator", "Recommendations", "Data Explorer"].index(default_page),
+        key="main_navigation"
     )
     
     # Simple routing

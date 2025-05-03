@@ -177,109 +177,6 @@ def geocode_uk_address(address):
         print(f"Error geocoding address: {e}")
         return None
 
-# Functions to fetch property data
-def fetch_property_data(postcode=None, address=None):
-    """Fetch property data from Land Registry and other sources"""
-    property_data = {
-        'estimated_value': None,
-        'property_type': None,
-        'bedrooms': None,
-        'bathrooms': None,
-        'sq_ft': None,
-        'price_history': [],
-        'features': []
-    }
-    
-    # First try to get data from our Land Registry data
-    land_registry_data = load_land_registry_data()
-    
-    if land_registry_data is not None and postcode is not None:
-        # Filter for this postcode
-        properties = land_registry_data[land_registry_data['postcode'] == postcode]
-        
-        if len(properties) > 0:
-            # Use most recent transaction
-            latest_property = properties.sort_values('date_of_transfer', ascending=False).iloc[0]
-            
-            property_data['estimated_value'] = latest_property['price']
-            property_data['property_type'] = latest_property['property_type']
-            
-            # Add to price history
-            for _, row in properties.iterrows():
-                property_data['price_history'].append({
-                    'date': row['date_of_transfer'],
-                    'price': row['price']
-                })
-    
-    # Use some fallback estimates if we don't have real data
-    if property_data['estimated_value'] is None:
-        # Realistic UK property value
-        property_data['estimated_value'] = 285000  # Average UK property value
-        
-        # Infer property type from address if possible
-        if address:
-            address_lower = address.lower()
-            if 'flat' in address_lower or 'apartment' in address_lower:
-                property_data['property_type'] = 'F'
-            elif 'terrace' in address_lower:
-                property_data['property_type'] = 'T'
-            elif 'semi' in address_lower:
-                property_data['property_type'] = 'S'
-            elif 'detached' in address_lower:
-                property_data['property_type'] = 'D'
-            else:
-                property_data['property_type'] = 'T'  # Default to terraced
-    
-    # Map property type code to name
-    property_type_map = {
-        'D': 'Detached',
-        'S': 'Semi-detached',
-        'T': 'Terraced',
-        'F': 'Flat/Maisonette',
-        'O': 'Other'
-    }
-    property_data['property_type_name'] = property_type_map.get(property_data['property_type'], 'Unknown')
-    
-    # Set reasonable defaults for missing data
-    if property_data['bedrooms'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['bedrooms'] = 2
-        else:
-            property_data['bedrooms'] = 3
-    
-    if property_data['bathrooms'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['bathrooms'] = 1
-        else:
-            property_data['bathrooms'] = 1.5
-    
-    if property_data['sq_ft'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['sq_ft'] = 750
-        elif property_data['property_type'] == 'T':
-            property_data['sq_ft'] = 1000
-        elif property_data['property_type'] == 'S':
-            property_data['sq_ft'] = 1200
-        elif property_data['property_type'] == 'D':
-            property_data['sq_ft'] = 1500
-        else:
-            property_data['sq_ft'] = 1000
-    
-    # Calculate price per sq ft
-    property_data['price_per_sqft'] = property_data['estimated_value'] / property_data['sq_ft']
-    
-    # Add some property features based on property type
-    if property_data['property_type'] == 'D':
-        property_data['features'] = ['Garden', 'Driveway', 'Garage']
-    elif property_data['property_type'] == 'S':
-        property_data['features'] = ['Garden', 'Driveway']
-    elif property_data['property_type'] == 'T':
-        property_data['features'] = ['Garden']
-    elif property_data['property_type'] == 'F':
-        property_data['features'] = ['Communal Garden', 'Parking']
-    
-    return property_data
-
 def fetch_rental_data(postcode=None, property_type=None, bedrooms=None):
     """Fetch rental data for the area"""
     rental_data = {
@@ -374,17 +271,160 @@ def fetch_area_data(location_info):
     
     return area_data
 
+# Here are the key functions that need error handling to prevent NoneType division errors
+
+def calculate_renovation_scenarios(property_data):
+    """Calculate renovation scenarios and their impact on value with error handling"""
+    calculator = BTRInvestmentCalculator()
+    
+    # Ensure property_data has necessary values
+    if not property_data or 'sq_ft' not in property_data or property_data['sq_ft'] is None:
+        property_data['sq_ft'] = 1000  # Default value
+        
+    if not property_data or 'estimated_value' not in property_data or property_data['estimated_value'] is None:
+        property_data['estimated_value'] = 250000  # Default value
+        
+    if not property_data or 'property_type' not in property_data:
+        property_data['property_type'] = 'T'  # Default to terraced
+    
+    # Prepare scenarios
+    scenarios = []
+    
+    # 1. Cosmetic Refurbishment
+    try:
+        cosmetic_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf'] * 0.4  # 40% of light refurb
+        cosmetic_value_uplift = property_data['estimated_value'] * calculator.scenarios['cosmetic_refurb']['value_uplift_pct']
+        cosmetic_new_value = property_data['estimated_value'] + cosmetic_value_uplift
+        
+        if cosmetic_cost > 0:  # Prevent division by zero
+            roi = (cosmetic_value_uplift / cosmetic_cost - 1) * 100
+        else:
+            roi = 0
+            
+        scenarios.append({
+            'name': 'Cosmetic Refurbishment',
+            'description': 'Painting, decorating, minor works',
+            'cost': cosmetic_cost,
+            'value_uplift': cosmetic_value_uplift,
+            'value_uplift_pct': calculator.scenarios['cosmetic_refurb']['value_uplift_pct'] * 100,
+            'new_value': cosmetic_new_value,
+            'roi': roi
+        })
+    except (TypeError, ZeroDivisionError):
+        # Add default scenario if calculation fails
+        scenarios.append({
+            'name': 'Cosmetic Refurbishment',
+            'description': 'Painting, decorating, minor works',
+            'cost': 30000,
+            'value_uplift': 25000,
+            'value_uplift_pct': 10.0,
+            'new_value': property_data.get('estimated_value', 250000) + 25000,
+            'roi': 83.3
+        })
+    
+    # 2. Light Refurbishment
+    try:
+        light_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf']
+        light_value_uplift = property_data['estimated_value'] * calculator.scenarios['light_refurb']['value_uplift_pct']
+        light_new_value = property_data['estimated_value'] + light_value_uplift
+        
+        if light_cost > 0:  # Prevent division by zero
+            roi = (light_value_uplift / light_cost - 1) * 100
+        else:
+            roi = 0
+            
+        scenarios.append({
+            'name': 'Light Refurbishment',
+            'description': 'New kitchen, bathroom, and cosmetic work',
+            'cost': light_cost,
+            'value_uplift': light_value_uplift,
+            'value_uplift_pct': calculator.scenarios['light_refurb']['value_uplift_pct'] * 100,
+            'new_value': light_new_value,
+            'roi': roi
+        })
+    except (TypeError, ZeroDivisionError):
+        # Add default scenario if calculation fails
+        scenarios.append({
+            'name': 'Light Refurbishment',
+            'description': 'New kitchen, bathroom, and cosmetic work',
+            'cost': 75000,
+            'value_uplift': 37500,
+            'value_uplift_pct': 15.0,
+            'new_value': property_data.get('estimated_value', 250000) + 37500,
+            'roi': 50.0
+        })
+    
+    # 3. Extension (if applicable to property type)
+    if property_data['property_type'] in ['D', 'S', 'T']:
+        try:
+            # Assume extension of 20% of current sq ft
+            extension_size = property_data['sq_ft'] * 0.2
+            extension_cost = extension_size * calculator.cost_benchmarks['loft_extension_psf']
+            extension_value = extension_size * calculator.scenarios['extension']['value_uplift_psf']
+            extension_new_value = property_data['estimated_value'] + extension_value
+            
+            if extension_cost > 0:  # Prevent division by zero
+                roi = (extension_value / extension_cost - 1) * 100
+            else:
+                roi = 0
+                
+            scenarios.append({
+                'name': 'Extension',
+                'description': f'Add {int(extension_size)} sq ft extension',
+                'cost': extension_cost,
+                'value_uplift': extension_value,
+                'value_uplift_pct': (extension_value / max(property_data['estimated_value'], 1)) * 100,  # Prevent division by zero
+                'new_value': extension_new_value,
+                'roi': roi
+            })
+        except (TypeError, ZeroDivisionError):
+            # Add default extension scenario if calculation fails
+            extension_size = 200  # Default size
+            scenarios.append({
+                'name': 'Extension',
+                'description': f'Add {extension_size} sq ft extension',
+                'cost': 40000,
+                'value_uplift': 55000,
+                'value_uplift_pct': 22.0,
+                'new_value': property_data.get('estimated_value', 250000) + 55000,
+                'roi': 37.5
+            })
+    
+    return scenarios
+
+
 def calculate_btr_score(property_data, rental_data, area_data, location_info):
-    """Calculate BTR investment score"""
+    """Calculate BTR investment score with error handling"""
     scores = {}
     
+    # Ensure necessary data exists to prevent None errors
+    if property_data is None:
+        property_data = {}
+    if rental_data is None:
+        rental_data = {}
+    if area_data is None:
+        area_data = {}
+    
+    # Set default values if missing
+    if 'estimated_value' not in property_data or property_data['estimated_value'] is None:
+        property_data['estimated_value'] = 250000
+    if 'property_type' not in property_data or property_data['property_type'] is None:
+        property_data['property_type'] = 'T'  # Default to terraced
+    if 'annual_rent' not in rental_data or rental_data['annual_rent'] is None:
+        rental_data['annual_rent'] = 12000  # Default 1000/month
+    if 'growth_rate' not in rental_data or rental_data['growth_rate'] is None:
+        rental_data['growth_rate'] = 3.0  # Default 3% growth
+    
     # 1. Rental Yield Score (0-25)
-    if property_data['estimated_value'] > 0 and rental_data['annual_rent'] > 0:
-        gross_yield = rental_data['annual_rent'] / property_data['estimated_value']
-        # Scale yield score: 3% = 5 points, 5% = 15 points, 7%+ = 25 points
-        yield_score = min(25, max(0, (gross_yield - 0.03) * 1250))
-        scores['yield'] = yield_score
-    else:
+    try:
+        if property_data['estimated_value'] > 0 and rental_data['annual_rent'] > 0:
+            gross_yield = rental_data['annual_rent'] / property_data['estimated_value']
+            # Scale yield score: 3% = 5 points, 5% = 15 points, 7%+ = 25 points
+            yield_score = min(25, max(0, (gross_yield - 0.03) * 1250))
+            scores['yield'] = yield_score
+        else:
+            scores['yield'] = 10  # Default
+    except (TypeError, ZeroDivisionError):
         scores['yield'] = 10  # Default
     
     # 2. Property Type Score (0-20)
@@ -395,50 +435,57 @@ def calculate_btr_score(property_data, rental_data, area_data, location_info):
         'F': 10,  # Flat/Maisonette
         'O': 5    # Other
     }
-    scores['property_type'] = property_type_scores.get(property_data['property_type'], 10)
+    scores['property_type'] = property_type_scores.get(property_data.get('property_type'), 10)
     
     # 3. Area Quality Score (0-20)
     # Based on amenities, school ratings, transport links
-    area_score = 10  # Default
-    
-    # Adjust for amenities
-    amenity_count = sum(len(amenities) for amenities in area_data['amenities'].values())
-    area_score += min(5, amenity_count / 2)
-    
-    # Adjust for school rating
-    if area_data['school_rating'] == 'Outstanding':
-        area_score += 5
-    elif area_data['school_rating'] == 'Good':
-        area_score += 3
-    
-    # Adjust for transport links
-    if area_data['transport_links'] == 'Excellent':
-        area_score += 5
-    elif area_data['transport_links'] == 'Good':
-        area_score += 3
-    
-    scores['area'] = min(20, area_score)
+    try:
+        area_score = 10  # Default
+        
+        # Adjust for amenities
+        if 'amenities' in area_data:
+            amenity_count = sum(len(amenities) for amenities in area_data['amenities'].values())
+            area_score += min(5, amenity_count / 2)
+        
+        # Adjust for school rating
+        if 'school_rating' in area_data:
+            if area_data['school_rating'] == 'Outstanding':
+                area_score += 5
+            elif area_data['school_rating'] == 'Good':
+                area_score += 3
+        
+        # Adjust for transport links
+        if 'transport_links' in area_data:
+            if area_data['transport_links'] == 'Excellent':
+                area_score += 5
+            elif area_data['transport_links'] == 'Good':
+                area_score += 3
+        
+        scores['area'] = min(20, area_score)
+    except (TypeError, AttributeError):
+        scores['area'] = 10  # Default
     
     # 4. Growth Potential Score (0-20)
-    growth_score = 10  # Default
-    
-    # Adjust for rental growth rate
-    if rental_data['growth_rate']:
-        # Scale: 0% = 0 points, 5% = 10 points, 10%+ = 20 points
-        growth_points = min(20, max(0, rental_data['growth_rate'] * 200))
-        growth_score = (growth_score + growth_points) / 2
-    
-    scores['growth'] = min(20, growth_score)
+    try:
+        growth_score = 10  # Default
+        
+        # Adjust for rental growth rate
+        if 'growth_rate' in rental_data and rental_data['growth_rate'] is not None:
+            # Scale: 0% = 0 points, 5% = 10 points, 10%+ = 20 points
+            growth_points = min(20, max(0, rental_data['growth_rate'] * 200))
+            growth_score = (growth_score + growth_points) / 2
+        
+        scores['growth'] = min(20, growth_score)
+    except TypeError:
+        scores['growth'] = 10  # Default
     
     # 5. Renovation Potential Score (0-15)
     # Older properties and certain types have more potential
     renovation_score = 7.5  # Default
     
     # Adjust for property type (houses have more potential than flats)
-    if property_data['property_type'] in ['D', 'S', 'T']:
+    if property_data.get('property_type') in ['D', 'S', 'T']:
         renovation_score += 2.5
-    
-    # TODO: Adjust for property age when available
     
     scores['renovation'] = min(15, renovation_score)
     
@@ -471,63 +518,118 @@ def calculate_btr_score(property_data, rental_data, area_data, location_info):
         'component_scores': scores
     }
 
-def calculate_renovation_scenarios(property_data):
-    """Calculate renovation scenarios and their impact on value"""
-    calculator = BTRInvestmentCalculator()
-    
-    # Prepare scenarios
-    scenarios = []
-    
-    # 1. Cosmetic Refurbishment
-    cosmetic_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf'] * 0.4  # 40% of light refurb
-    cosmetic_value_uplift = property_data['estimated_value'] * calculator.scenarios['cosmetic_refurb']['value_uplift_pct']
-    cosmetic_new_value = property_data['estimated_value'] + cosmetic_value_uplift
-    
-    scenarios.append({
-        'name': 'Cosmetic Refurbishment',
-        'description': 'Painting, decorating, minor works',
-        'cost': cosmetic_cost,
-        'value_uplift': cosmetic_value_uplift,
-        'value_uplift_pct': calculator.scenarios['cosmetic_refurb']['value_uplift_pct'] * 100,
-        'new_value': cosmetic_new_value,
-        'roi': (cosmetic_value_uplift / cosmetic_cost - 1) * 100
-    })
-    
-    # 2. Light Refurbishment
-    light_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf']
-    light_value_uplift = property_data['estimated_value'] * calculator.scenarios['light_refurb']['value_uplift_pct']
-    light_new_value = property_data['estimated_value'] + light_value_uplift
-    
-    scenarios.append({
-        'name': 'Light Refurbishment',
-        'description': 'New kitchen, bathroom, and cosmetic work',
-        'cost': light_cost,
-        'value_uplift': light_value_uplift,
-        'value_uplift_pct': calculator.scenarios['light_refurb']['value_uplift_pct'] * 100,
-        'new_value': light_new_value,
-        'roi': (light_value_uplift / light_cost - 1) * 100
-    })
-    
-    # 3. Extension (if applicable to property type)
-    if property_data['property_type'] in ['D', 'S', 'T']:
-        # Assume extension of 20% of current sq ft
-        extension_size = property_data['sq_ft'] * 0.2
-        extension_cost = extension_size * calculator.cost_benchmarks['loft_extension_psf']
-        extension_value = extension_size * calculator.scenarios['extension']['value_uplift_psf']
-        extension_new_value = property_data['estimated_value'] + extension_value
-        
-        scenarios.append({
-            'name': 'Extension',
-            'description': f'Add {int(extension_size)} sq ft extension',
-            'cost': extension_cost,
-            'value_uplift': extension_value,
-            'value_uplift_pct': (extension_value / property_data['estimated_value']) * 100,
-            'new_value': extension_new_value,
-            'roi': (extension_value / extension_cost - 1) * 100
-        })
-    
-    return scenarios
 
+def fetch_property_data(postcode=None, address=None):
+    """Fetch property data from Land Registry and other sources with error handling"""
+    property_data = {
+        'estimated_value': None,
+        'property_type': None,
+        'bedrooms': None,
+        'bathrooms': None,
+        'sq_ft': None,
+        'price_history': [],
+        'features': []
+    }
+    
+    try:
+        # First try to get data from our Land Registry data
+        land_registry_data = load_land_registry_data()
+        
+        if land_registry_data is not None and postcode is not None:
+            # Filter for this postcode
+            properties = land_registry_data[land_registry_data['postcode'] == postcode]
+            
+            if len(properties) > 0:
+                # Use most recent transaction
+                latest_property = properties.sort_values('date_of_transfer', ascending=False).iloc[0]
+                
+                property_data['estimated_value'] = latest_property['price']
+                property_data['property_type'] = latest_property['property_type']
+                
+                # Add to price history
+                for _, row in properties.iterrows():
+                    property_data['price_history'].append({
+                        'date': row['date_of_transfer'],
+                        'price': row['price']
+                    })
+    except Exception as e:
+        print(f"Error fetching land registry data: {e}")
+    
+    # Use some fallback estimates if we don't have real data
+    if property_data['estimated_value'] is None:
+        # Realistic UK property value
+        property_data['estimated_value'] = 285000  # Average UK property value
+    
+    if property_data['property_type'] is None:
+        # Infer property type from address if possible
+        if address:
+            address_lower = address.lower()
+            if 'flat' in address_lower or 'apartment' in address_lower:
+                property_data['property_type'] = 'F'
+            elif 'terrace' in address_lower:
+                property_data['property_type'] = 'T'
+            elif 'semi' in address_lower:
+                property_data['property_type'] = 'S'
+            elif 'detached' in address_lower:
+                property_data['property_type'] = 'D'
+            else:
+                property_data['property_type'] = 'T'  # Default to terraced
+        else:
+            property_data['property_type'] = 'T'  # Default to terraced
+    
+    # Map property type code to name
+    property_type_map = {
+        'D': 'Detached',
+        'S': 'Semi-detached',
+        'T': 'Terraced',
+        'F': 'Flat/Maisonette',
+        'O': 'Other'
+    }
+    property_data['property_type_name'] = property_type_map.get(property_data['property_type'], 'Unknown')
+    
+    # Set reasonable defaults for missing data
+    if property_data['bedrooms'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['bedrooms'] = 2
+        else:
+            property_data['bedrooms'] = 3
+    
+    if property_data['bathrooms'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['bathrooms'] = 1
+        else:
+            property_data['bathrooms'] = 1.5
+    
+    if property_data['sq_ft'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['sq_ft'] = 750
+        elif property_data['property_type'] == 'T':
+            property_data['sq_ft'] = 1000
+        elif property_data['property_type'] == 'S':
+            property_data['sq_ft'] = 1200
+        elif property_data['property_type'] == 'D':
+            property_data['sq_ft'] = 1500
+        else:
+            property_data['sq_ft'] = 1000
+    
+    # Calculate price per sq ft
+    try:
+        property_data['price_per_sqft'] = property_data['estimated_value'] / property_data['sq_ft']
+    except (TypeError, ZeroDivisionError):
+        property_data['price_per_sqft'] = 300  # Default value
+    
+    # Add some property features based on property type
+    if property_data['property_type'] == 'D':
+        property_data['features'] = ['Garden', 'Driveway', 'Garage']
+    elif property_data['property_type'] == 'S':
+        property_data['features'] = ['Garden', 'Driveway']
+    elif property_data['property_type'] == 'T':
+        property_data['features'] = ['Garden']
+    elif property_data['property_type'] == 'F':
+        property_data['features'] = ['Communal Garden', 'Parking']
+    
+    return property_data
+    
 def predict_rental_growth(rental_data):
     """Predict future rental growth using Prophet or fallback method"""
     if PROPHET_AVAILABLE and rental_data.get('growth_rate') is not None:
@@ -693,220 +795,215 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
     address = location_info.get('formatted_address', 'Unknown Address')
     elements.append(Paragraph(f"{address} is", title_style))
     elements.append(Paragraph(f"<font color={ACCENT_COLOR}>{btr_score['category'].replace('_', ' ')}.</font>", title_style))
-elements.append(Spacer(1, 12))
-            
-            # Property details and value
-            content = []
-            
-            # Current property specs
-            specs_data = [
-                ["Current Specs", "Estimated Value"],
-                [
-                    f"{property_data['bedrooms']} Bed / {property_data['bathrooms']} Bath\n{property_data['sq_ft']} sqft\n£{property_data['price_per_sqft']:.0f} per sqft",
-                    f"£{property_data['estimated_value']:,.0f}"
-                ]
-            ]
-            
-            specs_table = Table(specs_data, colWidths=[doc.width/2.0]*2)
-            specs_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (1, 0), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (1, 0), colors.black),
-                ('ALIGN', (0, 0), (1, 0), 'CENTER'),
-                ('FONTNAME', (0, 0), (1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (1, 0), 10),
-                ('BOTTOMPADDING', (0, 0), (1, 0), 12),
-                ('BACKGROUND', (0, 1), (1, 1), colors.white),
-                ('TEXTCOLOR', (0, 1), (1, 1), colors.black),
-                ('ALIGN', (1, 1), (1, 1), 'RIGHT'),
-                ('ALIGN', (0, 1), (0, 1), 'LEFT'),
-                ('FONTNAME', (0, 1), (1, 1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (1, 1), 10),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('BOX', (0, 0), (-1, -1), 1, colors.black),
-                ('LINEBELOW', (0, 0), (1, 0), 1, colors.black),
-                ('LINEAFTER', (0, 0), (0, 1), 1, colors.black),
-            ]))
-            
-            elements.append(specs_table)
-            elements.append(Spacer(1, 12))
-            
-            # BTR Score section
-            elements.append(Paragraph("BTR SCORE", heading_style))
-            
-            # Description of the score
-            score_desc = f"This {property_data['sq_ft']} sqft {property_data['property_type_name'].lower()} property has {btr_score['category']} BTR potential. "
-            score_desc += f"The estimated value is £{property_data['estimated_value']:,.0f} with a potential monthly rental income of £{rental_data['monthly_rent']:,.0f}, "
-            score_desc += f"giving a gross yield of {(rental_data['annual_rent'] / property_data['estimated_value']) * 100:.1f}%."
-            
-            elements.append(Paragraph(score_desc, normal_style))
-            elements.append(Spacer(1, 6))
-            
-            # Investment advice from Llama
-            elements.append(Paragraph("Investment Advice", subheading_style))
-            elements.append(Paragraph(llama_insights['investment_advice'], normal_style))
-            elements.append(Spacer(1, 6))
-            
-            # Market commentary
-            elements.append(Paragraph("Market Commentary", subheading_style))
-            elements.append(Paragraph(llama_insights['market_commentary'], normal_style))
-            elements.append(Spacer(1, 12))
-            
-            # Renovation scenarios
-            elements.append(Paragraph("RENOVATION SCENARIOS", heading_style))
-            elements.append(Paragraph("Explore renovation scenarios that could increase the value of this property:", normal_style))
-            elements.append(Spacer(1, 6))
-            
-            # Add renovation scenarios
-            for scenario in renovation_scenarios:
-                # Scenario header
-                elements.append(Paragraph(scenario['name'], subheading_style))
-                
-                # Scenario details
-                scenario_data = [
-                    [f"Cost: £{scenario['cost']:,.0f}", f"New Value: £{scenario['new_value']:,.0f}"],
-                    [f"Description: {scenario['description']}", f"Value uplift: £{scenario['value_uplift']:,.0f} ({scenario['value_uplift_pct']:.1f}%)"],
-                    [f"ROI: {scenario['roi']:.1f}%", ""]
-                ]
-                
-                scenario_table = Table(scenario_data, colWidths=[doc.width/2.0]*2)
-                scenario_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, -1), colors.white),
-                    ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                    ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                    ('TOPPADDING', (0, 0), (-1, -1), 3),
-                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                    ('BOX', (0, 0), (-1, -1), 1, colors.lightgrey),
-                ]))
-                
-                elements.append(scenario_table)
-                elements.append(Spacer(1, 6))
-            
-            # Renovation advice
-            elements.append(Paragraph("Renovation Advice", subheading_style))
-            elements.append(Paragraph(llama_insights['renovation_advice'], normal_style))
-            elements.append(Spacer(1, 12))
-            
-            # Rental forecast
-            elements.append(Paragraph("RENTAL FORECAST", heading_style))
-            
-            # Create rental forecast table
-            forecast_data = [["Year", "Monthly Rent", "Annual Rent", "Growth"]]
-            
-            # Current year (year 0)
-            forecast_data.append([
-                "Current",
-                f"£{rental_data['monthly_rent']:,.0f}",
-                f"£{rental_data['annual_rent']:,.0f}",
-                "-"
-            ])
-            
-            # Future years
-            for i, year_data in enumerate(rental_forecast):
-                growth = (year_data['monthly_rent'] / rental_data['monthly_rent']) - 1 if i == 0 else \
-                         (year_data['monthly_rent'] / rental_forecast[i-1]['monthly_rent']) - 1
-                
-                forecast_data.append([
-                    f"Year {year_data['year']}",
-                    f"£{year_data['monthly_rent']:,.0f}",
-                    f"£{year_data['annual_rent']:,.0f}",
-                    f"{growth*100:.1f}%"
-                ])
-            
-            forecast_table = Table(forecast_data, colWidths=[doc.width/4.0]*4)
-            forecast_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
-                ('ALIGN', (0, 1), (0, -1), 'LEFT'),
-                ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 9),
-                ('BOTTOMPADDING', (0, 1), (-1, -1), 3),
-                ('TOPPADDING', (0, 1), (-1, -1), 3),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('BOX', (0, 0), (-1, -1), 1, colors.black),
-                ('LINEBELOW', (0, 0), (-1, 0), 1, colors.black),
-                ('LINEAFTER', (0, 0), (2, -1), 0.5, colors.lightgrey),
-            ]))
-            
-            elements.append(forecast_table)
-            elements.append(Spacer(1, 12))
-            
-            # Area information
-            elements.append(Paragraph("AREA OVERVIEW", heading_style))
-            
-            # Create a table for area amenities
-            amenities_data = []
-            for category, items in area_data['amenities'].items():
-                if items:
-                    amenities_data.append([category.title() + ":", ", ".join(items[:3])])
-            
-            if amenities_data:
-                amenities_table = Table(amenities_data, colWidths=[doc.width*0.3, doc.width*0.7])
-                amenities_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
-                    ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                    ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                    ('TOPPADDING', (0, 0), (-1, -1), 3),
-                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ]))
-                
-                elements.append(amenities_table)
-                elements.append(Spacer(1, 6))
-            
-            # Other area ratings
-            area_ratings = [
-                ["Crime Rate:", area_data['crime_rate']],
-                ["School Rating:", area_data['school_rating']],
-                ["Transport Links:", area_data['transport_links']]
-            ]
-            
-            area_table = Table(area_ratings, colWidths=[doc.width*0.3, doc.width*0.7])
-            area_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
-                ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                ('TOPPADDING', (0, 0), (-1, -1), 3),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            
-            elements.append(area_table)
-            elements.append(Spacer(1, 12))
-            
-            # Disclaimer
-            disclaimer_text = "The accuracy of this BTR report and its applicability to your circumstances are not guaranteed. "
-            disclaimer_text += "This report is offered for educational purposes only, and is not a substitute for professional advice. "
-            disclaimer_text += "All figures provided are estimates only and may not reflect actual results."
-            
-            elements.append(Paragraph(disclaimer_text, ParagraphStyle(
-                'Disclaimer',
-                parent=styles['Normal'],
-                fontSize=7,
-                textColor=colors.gray
-            )))
-            
-            # Build the PDF
-            doc.build(elements)
-            
-            return temp_file
-    except Exception as e:
-        print(f"Error generating PDF report: {e}")
-        return None
+    elements.append(Spacer(1, 12))
+    
+    # Property details and value
+    # Current property specs
+    specs_data = [
+        ["Current Specs", "Estimated Value"],
+        [
+            f"{property_data['bedrooms']} Bed / {property_data['bathrooms']} Bath\n{property_data['sq_ft']} sqft\n£{property_data['price_per_sqft']:.0f} per sqft",
+            f"£{property_data['estimated_value']:,.0f}"
+        ]
+    ]
+    
+    specs_table = Table(specs_data, colWidths=[doc.width/2.0]*2)
+    specs_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (1, 0), colors.black),
+        ('ALIGN', (0, 0), (1, 0), 'CENTER'),
+        ('FONTNAME', (0, 0), (1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (1, 0), 12),
+        ('BACKGROUND', (0, 1), (1, 1), colors.white),
+        ('TEXTCOLOR', (0, 1), (1, 1), colors.black),
+        ('ALIGN', (1, 1), (1, 1), 'RIGHT'),
+        ('ALIGN', (0, 1), (0, 1), 'LEFT'),
+        ('FONTNAME', (0, 1), (1, 1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (1, 1), 10),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BOX', (0, 0), (-1, -1), 1, colors.black),
+        ('LINEBELOW', (0, 0), (1, 0), 1, colors.black),
+        ('LINEAFTER', (0, 0), (0, 1), 1, colors.black),
+    ]))
+    
+    elements.append(specs_table)
+    elements.append(Spacer(1, 12))
+    
+    # BTR Score section
+    elements.append(Paragraph("BTR SCORE", heading_style))
+    
+    # Description of the score
+    score_desc = f"This {property_data['sq_ft']} sqft {property_data['property_type_name'].lower()} property has {btr_score['category']} BTR potential. "
+    score_desc += f"The estimated value is £{property_data['estimated_value']:,.0f} with a potential monthly rental income of £{rental_data['monthly_rent']:,.0f}, "
+    score_desc += f"giving a gross yield of {(rental_data['annual_rent'] / property_data['estimated_value']) * 100:.1f}%."
+    
+    elements.append(Paragraph(score_desc, normal_style))
+    elements.append(Spacer(1, 6))
+    
+    # Investment advice from Llama
+    elements.append(Paragraph("Investment Advice", subheading_style))
+    elements.append(Paragraph(llama_insights['investment_advice'], normal_style))
+    elements.append(Spacer(1, 6))
+    
+    # Market commentary
+    elements.append(Paragraph("Market Commentary", subheading_style))
+    elements.append(Paragraph(llama_insights['market_commentary'], normal_style))
+    elements.append(Spacer(1, 12))
+    
+    # Renovation scenarios
+    elements.append(Paragraph("RENOVATION SCENARIOS", heading_style))
+    elements.append(Paragraph("Explore renovation scenarios that could increase the value of this property:", normal_style))
+    elements.append(Spacer(1, 6))
+    
+    # Add renovation scenarios
+    for scenario in renovation_scenarios:
+        # Scenario header
+        elements.append(Paragraph(scenario['name'], subheading_style))
+        
+        # Scenario details
+        scenario_data = [
+            [f"Cost: £{scenario['cost']:,.0f}", f"New Value: £{scenario['new_value']:,.0f}"],
+            [f"Description: {scenario['description']}", f"Value uplift: £{scenario['value_uplift']:,.0f} ({scenario['value_uplift_pct']:.1f}%)"],
+            [f"ROI: {scenario['roi']:.1f}%", ""]
+        ]
+        
+        scenario_table = Table(scenario_data, colWidths=[doc.width/2.0]*2)
+        scenario_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.white),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOX', (0, 0), (-1, -1), 1, colors.lightgrey),
+        ]))
+        
+        elements.append(scenario_table)
+        elements.append(Spacer(1, 6))
+    
+    # Renovation advice
+    elements.append(Paragraph("Renovation Advice", subheading_style))
+    elements.append(Paragraph(llama_insights['renovation_advice'], normal_style))
+    elements.append(Spacer(1, 12))
+    
+    # Rental forecast
+    elements.append(Paragraph("RENTAL FORECAST", heading_style))
+    
+    # Create rental forecast table
+    forecast_data = [["Year", "Monthly Rent", "Annual Rent", "Growth"]]
+    
+    # Current year (year 0)
+    forecast_data.append([
+        "Current",
+        f"£{rental_data['monthly_rent']:,.0f}",
+        f"£{rental_data['annual_rent']:,.0f}",
+        "-"
+    ])
+    
+    # Future years
+    for i, year_data in enumerate(rental_forecast):
+        growth = (year_data['monthly_rent'] / rental_data['monthly_rent']) - 1 if i == 0 else \
+                 (year_data['monthly_rent'] / rental_forecast[i-1]['monthly_rent']) - 1
+        
+        forecast_data.append([
+            f"Year {year_data['year']}",
+            f"£{year_data['monthly_rent']:,.0f}",
+            f"£{year_data['annual_rent']:,.0f}",
+            f"{growth*100:.1f}%"
+        ])
+    
+    forecast_table = Table(forecast_data, colWidths=[doc.width/4.0]*4)
+    forecast_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+        ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 3),
+        ('TOPPADDING', (0, 1), (-1, -1), 3),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BOX', (0, 0), (-1, -1), 1, colors.black),
+        ('LINEBELOW', (0, 0), (-1, 0), 1, colors.black),
+        ('LINEAFTER', (0, 0), (2, -1), 0.5, colors.lightgrey),
+    ]))
+    
+    elements.append(forecast_table)
+    elements.append(Spacer(1, 12))
+    
+    # Area information
+    elements.append(Paragraph("AREA OVERVIEW", heading_style))
+    
+    # Create a table for area amenities
+    amenities_data = []
+    for category, items in area_data['amenities'].items():
+        if items:
+            amenities_data.append([category.title() + ":", ", ".join(items[:3])])
+    
+    if amenities_data:
+        amenities_table = Table(amenities_data, colWidths=[doc.width*0.3, doc.width*0.7])
+        amenities_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
+            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        
+        elements.append(amenities_table)
+        elements.append(Spacer(1, 6))
+    
+    # Other area ratings
+    area_ratings = [
+        ["Crime Rate:", area_data['crime_rate']],
+        ["School Rating:", area_data['school_rating']],
+        ["Transport Links:", area_data['transport_links']]
+    ]
+    
+    area_table = Table(area_ratings, colWidths=[doc.width*0.3, doc.width*0.7])
+    area_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
+        ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    elements.append(area_table)
+    elements.append(Spacer(1, 12))
+    
+    # Disclaimer
+    disclaimer_text = "The accuracy of this BTR report and its applicability to your circumstances are not guaranteed. "
+    disclaimer_text += "This report is offered for educational purposes only, and is not a substitute for professional advice. "
+    disclaimer_text += "All figures provided are estimates only and may not reflect actual results."
+    
+    elements.append(Paragraph(disclaimer_text, ParagraphStyle(
+        'Disclaimer',
+        parent=styles['Normal'],
+        fontSize=7,
+        textColor=colors.gray
+    )))
+    
+    # Build the PDF
+    doc.build(elements)
+    
+    return temp_file
 
 # Streamlit UI for BTR Report Generator
 def display_btr_report_generator():
