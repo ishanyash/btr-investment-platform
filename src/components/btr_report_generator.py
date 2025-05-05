@@ -25,36 +25,24 @@ from reportlab.lib.units import inch
 import tempfile
 import uuid
 
-# For Prophet forecasting
-try:
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:
-    PROPHET_AVAILABLE = False
-    
-# For Llama integration
-try:
-    import ollama
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
-
-# Add the project root to the Python path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(script_dir))
-sys.path.append(project_root)
-
-# Ensure directories exist
-os.makedirs('data/processed', exist_ok=True)
-os.makedirs('data/raw', exist_ok=True)
-os.makedirs('reports', exist_ok=True)
-
-# Import utils from project if available
+# Import our utilities
 try:
     from src.utils.data_processor import load_land_registry_data, load_ons_rental_data, postcode_to_area
     from src.components.investment_calculator import BTRInvestmentCalculator
+    from src.utils.data_estimation_utils import (
+        get_cached_data, save_to_cache, estimate_property_value, 
+        estimate_rental_income, estimate_area_data, estimate_epc_rating,
+        add_data_quality_indicators
+    )
 except ImportError:
-    # Fallback implementations
+    # Import our enhanced estimation utilities directly if not found in project structure
+    from data_estimation_utils import (
+        get_cached_data, save_to_cache, estimate_property_value,
+        estimate_rental_income, estimate_area_data, estimate_epc_rating,
+        add_data_quality_indicators
+    )
+    
+    # Fallback implementations for other modules
     def load_land_registry_data():
         """Fallback implementation if module can't be loaded"""
         try:
@@ -115,16 +103,33 @@ except ImportError:
                 }
             }
 
-# Styling constants
+# For Ollama AI integration
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
+# Define constants
 ACCENT_COLOR = "#4CAF50"  # Green accent color
 SECONDARY_COLOR = "#2196F3"  # Blue for secondary elements
 
-# Geocoding API for converting addresses to coordinates and data
+# Ensure directories exist
+os.makedirs('data/processed', exist_ok=True)
+os.makedirs('data/raw', exist_ok=True)
+os.makedirs('data/cache', exist_ok=True)
+os.makedirs('reports', exist_ok=True)
+
+# Geocoding function
 def geocode_uk_address(address):
     """Convert UK address to coordinates and extract details using external API"""
     try:
-        # First try to clean and format the address
-        # Remove unnecessary terms to improve geocoding
+        # Check cache first
+        cached_data = get_cached_data(address, 'location')
+        if cached_data:
+            return cached_data
+        
+        # Clean and format the address
         address = re.sub(r'flat\s+\d+,?\s*', '', address, flags=re.IGNORECASE)
         address = re.sub(r'apartment\s+\d+,?\s*', '', address, flags=re.IGNORECASE)
         
@@ -132,8 +137,7 @@ def geocode_uk_address(address):
         if not re.search(r'\buk\b|\bunitee?\s*kingdom\b', address, flags=re.IGNORECASE):
             address = f"{address}, UK"
         
-        # Try with Google Maps API-like service (requires API key)
-        # For demo, use OpenStreetMap Nominatim API (use with caution in production)
+        # Use OpenStreetMap Nominatim API
         url = f"https://nominatim.openstreetmap.org/search?q={address}&format=json&addressdetails=1&countrycodes=gb"
         
         # Add delay to respect usage policies
@@ -160,7 +164,7 @@ def geocode_uk_address(address):
             # Create a clean formatted address
             formatted_address = result.get('display_name', address)
             
-            return {
+            location_data = {
                 'lat': lat,
                 'lon': lon,
                 'city': city,
@@ -171,21 +175,154 @@ def geocode_uk_address(address):
                 'formatted_address': formatted_address,
                 'raw_data': result
             }
+            
+            # Cache the result
+            save_to_cache(address, 'location', location_data)
+            
+            return location_data
         
         return None
     except Exception as e:
         print(f"Error geocoding address: {e}")
         return None
 
-def fetch_rental_data(postcode=None, property_type=None, bedrooms=None):
+# Property data functions
+def fetch_property_data(postcode=None, address=None, location_info=None):
+    """Fetch property data from Land Registry and other sources"""
+    # Check cache first
+    cache_key = postcode or address
+    if cache_key:
+        cached_data = get_cached_data(cache_key, 'property')
+        if cached_data:
+            return cached_data
+    
+    property_data = {
+        'estimated_value': None,
+        'property_type': None,
+        'bedrooms': None,
+        'bathrooms': None,
+        'sq_ft': None,
+        'price_history': [],
+        'features': [],
+        'data_quality': 'estimated'
+    }
+    
+    # First try to get data from our Land Registry data
+    land_registry_data = load_land_registry_data()
+    
+    if land_registry_data is not None and postcode is not None:
+        # Filter for this postcode
+        properties = land_registry_data[land_registry_data['postcode'] == postcode]
+        
+        if len(properties) > 0:
+            # Use most recent transaction
+            latest_property = properties.sort_values('date_of_transfer', ascending=False).iloc[0]
+            
+            property_data['estimated_value'] = latest_property['price']
+            property_data['property_type'] = latest_property['property_type']
+            property_data['data_quality'] = 'verified'
+            
+            # Add to price history
+            for _, row in properties.iterrows():
+                property_data['price_history'].append({
+                    'date': row['date_of_transfer'],
+                    'price': row['price']
+                })
+    
+    # Use fallback estimates if we don't have real data
+    if property_data['estimated_value'] is None:
+        # Use our enhanced estimation function
+        property_data['estimated_value'] = estimate_property_value(
+            location_info, 
+            property_data.get('property_type'),
+            property_data.get('bedrooms')
+        )
+        
+        # Infer property type from address if possible
+        if address:
+            address_lower = address.lower()
+            if 'flat' in address_lower or 'apartment' in address_lower:
+                property_data['property_type'] = 'F'
+            elif 'terrace' in address_lower:
+                property_data['property_type'] = 'T'
+            elif 'semi' in address_lower:
+                property_data['property_type'] = 'S'
+            elif 'detached' in address_lower:
+                property_data['property_type'] = 'D'
+            else:
+                property_data['property_type'] = 'T'  # Default to terraced
+    
+    # Map property type code to name
+    property_type_map = {
+        'D': 'Detached',
+        'S': 'Semi-detached',
+        'T': 'Terraced',
+        'F': 'Flat/Maisonette',
+        'O': 'Other'
+    }
+    property_data['property_type_name'] = property_type_map.get(property_data['property_type'], 'Unknown')
+    
+    # Set reasonable defaults for missing data
+    if property_data['bedrooms'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['bedrooms'] = 2
+        else:
+            property_data['bedrooms'] = 3
+    
+    if property_data['bathrooms'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['bathrooms'] = 1
+        else:
+            property_data['bathrooms'] = property_data['bedrooms'] * 0.5  # Approximately half as many bathrooms as bedrooms
+    
+    if property_data['sq_ft'] is None:
+        if property_data['property_type'] == 'F':
+            property_data['sq_ft'] = 750
+        elif property_data['property_type'] == 'T':
+            property_data['sq_ft'] = 1000
+        elif property_data['property_type'] == 'S':
+            property_data['sq_ft'] = 1200
+        elif property_data['property_type'] == 'D':
+            property_data['sq_ft'] = 1500
+        else:
+            property_data['sq_ft'] = 1000
+    
+    # Calculate price per sq ft
+    property_data['price_per_sqft'] = property_data['estimated_value'] / property_data['sq_ft']
+    
+    # Add property features based on property type
+    if property_data['property_type'] == 'D':
+        property_data['features'] = ['Garden', 'Driveway', 'Garage']
+    elif property_data['property_type'] == 'S':
+        property_data['features'] = ['Garden', 'Driveway']
+    elif property_data['property_type'] == 'T':
+        property_data['features'] = ['Garden']
+    elif property_data['property_type'] == 'F':
+        property_data['features'] = ['Communal Garden', 'Parking']
+    
+    # Cache the data
+    if cache_key:
+        save_to_cache(cache_key, 'property', property_data)
+    
+    return property_data
+
+def fetch_rental_data(postcode=None, property_type=None, bedrooms=None, location_info=None, property_data=None):
     """Fetch rental data for the area"""
+    # Check cache first
+    cache_key = postcode or (location_info and location_info.get('postcode'))
+    if cache_key:
+        cached_data = get_cached_data(cache_key, 'rental')
+        if cached_data:
+            return cached_data
+    
     rental_data = {
         'monthly_rent': None,
         'annual_rent': None,
         'gross_yield': None,
         'growth_rate': None,
         'rental_demand': 'Medium',
-        'void_periods': '2 weeks per year'
+        'void_periods': '2 weeks per year',
+        'data_quality': 'estimated'
     }
     
     # Try to get data from our ONS rental data
@@ -211,220 +348,57 @@ def fetch_rental_data(postcode=None, property_type=None, bedrooms=None):
                 # Check for growth rate
                 if 'yoy_growth' in area_data.columns:
                     rental_data['growth_rate'] = area_data['yoy_growth'].mean()
+                
+                rental_data['data_quality'] = 'verified'
     
-    # Use fallback estimates if we don't have real data
+    # Use our estimation function if we don't have real data
     if rental_data['monthly_rent'] is None:
-        # Estimate based on property type and location
-        if property_type == 'F':
-            rental_data['monthly_rent'] = 850
-        elif property_type == 'T':
-            rental_data['monthly_rent'] = 1000
-        elif property_type == 'S':
-            rental_data['monthly_rent'] = 1200
-        elif property_type == 'D':
-            rental_data['monthly_rent'] = 1500
-        else:
-            rental_data['monthly_rent'] = 1000
-        
-        # Adjust for bedrooms
-        if bedrooms:
-            rental_data['monthly_rent'] += (bedrooms - 2) * 150  # Adjust rent by £150 per bedroom
+        estimated_rental = estimate_rental_income(property_data, location_info)
+        rental_data.update(estimated_rental)
     
-    # Calculate annual rent
-    rental_data['annual_rent'] = rental_data['monthly_rent'] * 12
+    # Calculate annual rent if we have monthly
+    if rental_data['monthly_rent'] and not rental_data['annual_rent']:
+        rental_data['annual_rent'] = rental_data['monthly_rent'] * 12
+    
+    # Calculate gross yield if possible
+    if property_data and 'estimated_value' in property_data and rental_data['annual_rent']:
+        rental_data['gross_yield'] = rental_data['annual_rent'] / property_data['estimated_value']
+    
+    # Cache the data
+    if cache_key:
+        save_to_cache(cache_key, 'rental', rental_data)
     
     return rental_data
 
 def fetch_area_data(location_info):
     """Fetch data about the local area"""
-    area_data = {
-        'amenities': {
-            'schools': [],
-            'transport': [],
-            'healthcare': [],
-            'shops': [],
-            'leisure': []
-        },
-        'crime_rate': None,
-        'school_rating': None,
-        'transport_links': None,
-        'planning_applications': [],
-        'area_description': None
-    }
+    # Check cache first
+    cache_key = location_info.get('postcode') or location_info.get('formatted_address')
+    if cache_key:
+        cached_data = get_cached_data(cache_key, 'area')
+        if cached_data:
+            return cached_data
     
-    # Try to get amenities from postcode
-    if 'postcode' in location_info:
-        postcode = location_info['postcode']
-        # TODO: Implement actual data fetching from our database
+    # Use our estimation function to get area data
+    area_data = estimate_area_data(location_info)
     
-    # Use fallback estimates for now
-    area_data['crime_rate'] = 'Medium'
-    area_data['school_rating'] = 'Good'
-    area_data['transport_links'] = 'Average'
-    
-    # Add some sample amenities
-    area_data['amenities']['schools'] = ['Primary School (0.3 miles)', 'Secondary School (0.8 miles)']
-    area_data['amenities']['transport'] = ['Bus Stop (0.1 miles)', 'Train Station (0.7 miles)']
-    area_data['amenities']['healthcare'] = ['GP Surgery (0.4 miles)', 'Hospital (2.1 miles)']
-    area_data['amenities']['shops'] = ['Supermarket (0.3 miles)', 'Shopping Center (1.2 miles)']
-    area_data['amenities']['leisure'] = ['Park (0.2 miles)', 'Gym (0.5 miles)']
+    # Cache the data
+    if cache_key:
+        save_to_cache(cache_key, 'area', area_data)
     
     return area_data
 
-# Here are the key functions that need error handling to prevent NoneType division errors
-
-def calculate_renovation_scenarios(property_data):
-    """Calculate renovation scenarios and their impact on value with error handling"""
-    calculator = BTRInvestmentCalculator()
-    
-    # Ensure property_data has necessary values
-    if not property_data or 'sq_ft' not in property_data or property_data['sq_ft'] is None:
-        property_data['sq_ft'] = 1000  # Default value
-        
-    if not property_data or 'estimated_value' not in property_data or property_data['estimated_value'] is None:
-        property_data['estimated_value'] = 250000  # Default value
-        
-    if not property_data or 'property_type' not in property_data:
-        property_data['property_type'] = 'T'  # Default to terraced
-    
-    # Prepare scenarios
-    scenarios = []
-    
-    # 1. Cosmetic Refurbishment
-    try:
-        cosmetic_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf'] * 0.4  # 40% of light refurb
-        cosmetic_value_uplift = property_data['estimated_value'] * calculator.scenarios['cosmetic_refurb']['value_uplift_pct']
-        cosmetic_new_value = property_data['estimated_value'] + cosmetic_value_uplift
-        
-        if cosmetic_cost > 0:  # Prevent division by zero
-            roi = (cosmetic_value_uplift / cosmetic_cost - 1) * 100
-        else:
-            roi = 0
-            
-        scenarios.append({
-            'name': 'Cosmetic Refurbishment',
-            'description': 'Painting, decorating, minor works',
-            'cost': cosmetic_cost,
-            'value_uplift': cosmetic_value_uplift,
-            'value_uplift_pct': calculator.scenarios['cosmetic_refurb']['value_uplift_pct'] * 100,
-            'new_value': cosmetic_new_value,
-            'roi': roi
-        })
-    except (TypeError, ZeroDivisionError):
-        # Add default scenario if calculation fails
-        scenarios.append({
-            'name': 'Cosmetic Refurbishment',
-            'description': 'Painting, decorating, minor works',
-            'cost': 30000,
-            'value_uplift': 25000,
-            'value_uplift_pct': 10.0,
-            'new_value': property_data.get('estimated_value', 250000) + 25000,
-            'roi': 83.3
-        })
-    
-    # 2. Light Refurbishment
-    try:
-        light_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf']
-        light_value_uplift = property_data['estimated_value'] * calculator.scenarios['light_refurb']['value_uplift_pct']
-        light_new_value = property_data['estimated_value'] + light_value_uplift
-        
-        if light_cost > 0:  # Prevent division by zero
-            roi = (light_value_uplift / light_cost - 1) * 100
-        else:
-            roi = 0
-            
-        scenarios.append({
-            'name': 'Light Refurbishment',
-            'description': 'New kitchen, bathroom, and cosmetic work',
-            'cost': light_cost,
-            'value_uplift': light_value_uplift,
-            'value_uplift_pct': calculator.scenarios['light_refurb']['value_uplift_pct'] * 100,
-            'new_value': light_new_value,
-            'roi': roi
-        })
-    except (TypeError, ZeroDivisionError):
-        # Add default scenario if calculation fails
-        scenarios.append({
-            'name': 'Light Refurbishment',
-            'description': 'New kitchen, bathroom, and cosmetic work',
-            'cost': 75000,
-            'value_uplift': 37500,
-            'value_uplift_pct': 15.0,
-            'new_value': property_data.get('estimated_value', 250000) + 37500,
-            'roi': 50.0
-        })
-    
-    # 3. Extension (if applicable to property type)
-    if property_data['property_type'] in ['D', 'S', 'T']:
-        try:
-            # Assume extension of 20% of current sq ft
-            extension_size = property_data['sq_ft'] * 0.2
-            extension_cost = extension_size * calculator.cost_benchmarks['loft_extension_psf']
-            extension_value = extension_size * calculator.scenarios['extension']['value_uplift_psf']
-            extension_new_value = property_data['estimated_value'] + extension_value
-            
-            if extension_cost > 0:  # Prevent division by zero
-                roi = (extension_value / extension_cost - 1) * 100
-            else:
-                roi = 0
-                
-            scenarios.append({
-                'name': 'Extension',
-                'description': f'Add {int(extension_size)} sq ft extension',
-                'cost': extension_cost,
-                'value_uplift': extension_value,
-                'value_uplift_pct': (extension_value / max(property_data['estimated_value'], 1)) * 100,  # Prevent division by zero
-                'new_value': extension_new_value,
-                'roi': roi
-            })
-        except (TypeError, ZeroDivisionError):
-            # Add default extension scenario if calculation fails
-            extension_size = 200  # Default size
-            scenarios.append({
-                'name': 'Extension',
-                'description': f'Add {extension_size} sq ft extension',
-                'cost': 40000,
-                'value_uplift': 55000,
-                'value_uplift_pct': 22.0,
-                'new_value': property_data.get('estimated_value', 250000) + 55000,
-                'roi': 37.5
-            })
-    
-    return scenarios
-
-
 def calculate_btr_score(property_data, rental_data, area_data, location_info):
-    """Calculate BTR investment score with error handling"""
+    """Calculate BTR investment score"""
     scores = {}
     
-    # Ensure necessary data exists to prevent None errors
-    if property_data is None:
-        property_data = {}
-    if rental_data is None:
-        rental_data = {}
-    if area_data is None:
-        area_data = {}
-    
-    # Set default values if missing
-    if 'estimated_value' not in property_data or property_data['estimated_value'] is None:
-        property_data['estimated_value'] = 250000
-    if 'property_type' not in property_data or property_data['property_type'] is None:
-        property_data['property_type'] = 'T'  # Default to terraced
-    if 'annual_rent' not in rental_data or rental_data['annual_rent'] is None:
-        rental_data['annual_rent'] = 12000  # Default 1000/month
-    if 'growth_rate' not in rental_data or rental_data['growth_rate'] is None:
-        rental_data['growth_rate'] = 3.0  # Default 3% growth
-    
     # 1. Rental Yield Score (0-25)
-    try:
-        if property_data['estimated_value'] > 0 and rental_data['annual_rent'] > 0:
-            gross_yield = rental_data['annual_rent'] / property_data['estimated_value']
-            # Scale yield score: 3% = 5 points, 5% = 15 points, 7%+ = 25 points
-            yield_score = min(25, max(0, (gross_yield - 0.03) * 1250))
-            scores['yield'] = yield_score
-        else:
-            scores['yield'] = 10  # Default
-    except (TypeError, ZeroDivisionError):
+    if property_data['estimated_value'] > 0 and rental_data['annual_rent'] > 0:
+        gross_yield = rental_data['annual_rent'] / property_data['estimated_value']
+        # Scale yield score: 3% = 5 points, 5% = 15 points, 7%+ = 25 points
+        yield_score = min(25, max(0, (gross_yield - 0.03) * 1250))
+        scores['yield'] = yield_score
+    else:
         scores['yield'] = 10  # Default
     
     # 2. Property Type Score (0-20)
@@ -435,56 +409,47 @@ def calculate_btr_score(property_data, rental_data, area_data, location_info):
         'F': 10,  # Flat/Maisonette
         'O': 5    # Other
     }
-    scores['property_type'] = property_type_scores.get(property_data.get('property_type'), 10)
+    scores['property_type'] = property_type_scores.get(property_data['property_type'], 10)
     
     # 3. Area Quality Score (0-20)
     # Based on amenities, school ratings, transport links
-    try:
-        area_score = 10  # Default
-        
-        # Adjust for amenities
-        if 'amenities' in area_data:
-            amenity_count = sum(len(amenities) for amenities in area_data['amenities'].values())
-            area_score += min(5, amenity_count / 2)
-        
-        # Adjust for school rating
-        if 'school_rating' in area_data:
-            if area_data['school_rating'] == 'Outstanding':
-                area_score += 5
-            elif area_data['school_rating'] == 'Good':
-                area_score += 3
-        
-        # Adjust for transport links
-        if 'transport_links' in area_data:
-            if area_data['transport_links'] == 'Excellent':
-                area_score += 5
-            elif area_data['transport_links'] == 'Good':
-                area_score += 3
-        
-        scores['area'] = min(20, area_score)
-    except (TypeError, AttributeError):
-        scores['area'] = 10  # Default
+    area_score = 10  # Default
+    
+    # Adjust for amenities
+    amenity_count = sum(len(amenities) for amenities in area_data['amenities'].values())
+    area_score += min(5, amenity_count / 2)
+    
+    # Adjust for school rating
+    if area_data['school_rating'] == 'Outstanding':
+        area_score += 5
+    elif area_data['school_rating'] == 'Good':
+        area_score += 3
+    
+    # Adjust for transport links
+    if area_data['transport_links'] == 'Excellent':
+        area_score += 5
+    elif area_data['transport_links'] == 'Good':
+        area_score += 3
+    
+    scores['area'] = min(20, area_score)
     
     # 4. Growth Potential Score (0-20)
-    try:
-        growth_score = 10  # Default
-        
-        # Adjust for rental growth rate
-        if 'growth_rate' in rental_data and rental_data['growth_rate'] is not None:
-            # Scale: 0% = 0 points, 5% = 10 points, 10%+ = 20 points
-            growth_points = min(20, max(0, rental_data['growth_rate'] * 200))
-            growth_score = (growth_score + growth_points) / 2
-        
-        scores['growth'] = min(20, growth_score)
-    except TypeError:
-        scores['growth'] = 10  # Default
+    growth_score = 10  # Default
+    
+    # Adjust for rental growth rate
+    if rental_data['growth_rate']:
+        # Scale: 0% = 0 points, 5% = 10 points, 10%+ = 20 points
+        growth_points = min(20, max(0, rental_data['growth_rate'] * 200))
+        growth_score = (growth_score + growth_points) / 2
+    
+    scores['growth'] = min(20, growth_score)
     
     # 5. Renovation Potential Score (0-15)
     # Older properties and certain types have more potential
     renovation_score = 7.5  # Default
     
     # Adjust for property type (houses have more potential than flats)
-    if property_data.get('property_type') in ['D', 'S', 'T']:
+    if property_data['property_type'] in ['D', 'S', 'T']:
         renovation_score += 2.5
     
     scores['renovation'] = min(15, renovation_score)
@@ -518,233 +483,198 @@ def calculate_btr_score(property_data, rental_data, area_data, location_info):
         'component_scores': scores
     }
 
+def calculate_renovation_scenarios(property_data):
+    """Calculate renovation scenarios and their impact on value"""
+    calculator = BTRInvestmentCalculator()
+    
+    # Prepare scenarios
+    scenarios = []
+    
+    # 1. Cosmetic Refurbishment
+    cosmetic_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf'] * 0.4  # 40% of light refurb
+    cosmetic_value_uplift = property_data['estimated_value'] * calculator.scenarios['cosmetic_refurb']['value_uplift_pct']
+    cosmetic_new_value = property_data['estimated_value'] + cosmetic_value_uplift
+    
+    scenarios.append({
+        'name': 'Cosmetic Refurbishment',
+        'description': 'Painting, decorating, minor works',
+        'cost': cosmetic_cost,
+        'value_uplift': cosmetic_value_uplift,
+        'value_uplift_pct': calculator.scenarios['cosmetic_refurb']['value_uplift_pct'] * 100,
+        'new_value': cosmetic_new_value,
+        'roi': (cosmetic_value_uplift / cosmetic_cost - 1) * 100
+    })
+    
+    # 2. Light Refurbishment
+    light_cost = property_data['sq_ft'] * calculator.cost_benchmarks['light_refurb_psf']
+    light_value_uplift = property_data['estimated_value'] * calculator.scenarios['light_refurb']['value_uplift_pct']
+    light_new_value = property_data['estimated_value'] + light_value_uplift
+    
+    scenarios.append({
+        'name': 'Light Refurbishment',
+        'description': 'New kitchen, bathroom, and cosmetic work',
+        'cost': light_cost,
+        'value_uplift': light_value_uplift,
+        'value_uplift_pct': calculator.scenarios['light_refurb']['value_uplift_pct'] * 100,
+        'new_value': light_new_value,
+        'roi': (light_value_uplift / light_cost - 1) * 100
+    })
+    
+    # 3. Extension (if applicable to property type)
+    if property_data['property_type'] in ['D', 'S', 'T']:
+        # Assume extension of 20% of current sq ft
+        extension_size = property_data['sq_ft'] * 0.2
+        extension_cost = extension_size * calculator.cost_benchmarks['loft_extension_psf']
+        extension_value = extension_size * calculator.scenarios['extension']['value_uplift_psf']
+        extension_new_value = property_data['estimated_value'] + extension_value
+        
+        scenarios.append({
+            'name': 'Extension',
+            'description': f'Add {int(extension_size)} sq ft extension',
+            'cost': extension_cost,
+            'value_uplift': extension_value,
+            'value_uplift_pct': (extension_value / property_data['estimated_value']) * 100,
+            'new_value': extension_new_value,
+            'roi': (extension_value / extension_cost - 1) * 100
+        })
+    
+    return scenarios
 
-def fetch_property_data(postcode=None, address=None):
-    """Fetch property data from Land Registry and other sources with error handling"""
-    property_data = {
-        'estimated_value': None,
-        'property_type': None,
-        'bedrooms': None,
-        'bathrooms': None,
-        'sq_ft': None,
-        'price_history': [],
-        'features': []
-    }
-    
-    try:
-        # First try to get data from our Land Registry data
-        land_registry_data = load_land_registry_data()
-        
-        if land_registry_data is not None and postcode is not None:
-            # Filter for this postcode
-            properties = land_registry_data[land_registry_data['postcode'] == postcode]
-            
-            if len(properties) > 0:
-                # Use most recent transaction
-                latest_property = properties.sort_values('date_of_transfer', ascending=False).iloc[0]
-                
-                property_data['estimated_value'] = latest_property['price']
-                property_data['property_type'] = latest_property['property_type']
-                
-                # Add to price history
-                for _, row in properties.iterrows():
-                    property_data['price_history'].append({
-                        'date': row['date_of_transfer'],
-                        'price': row['price']
-                    })
-    except Exception as e:
-        print(f"Error fetching land registry data: {e}")
-    
-    # Use some fallback estimates if we don't have real data
-    if property_data['estimated_value'] is None:
-        # Realistic UK property value
-        property_data['estimated_value'] = 285000  # Average UK property value
-    
-    if property_data['property_type'] is None:
-        # Infer property type from address if possible
-        if address:
-            address_lower = address.lower()
-            if 'flat' in address_lower or 'apartment' in address_lower:
-                property_data['property_type'] = 'F'
-            elif 'terrace' in address_lower:
-                property_data['property_type'] = 'T'
-            elif 'semi' in address_lower:
-                property_data['property_type'] = 'S'
-            elif 'detached' in address_lower:
-                property_data['property_type'] = 'D'
-            else:
-                property_data['property_type'] = 'T'  # Default to terraced
-        else:
-            property_data['property_type'] = 'T'  # Default to terraced
-    
-    # Map property type code to name
-    property_type_map = {
-        'D': 'Detached',
-        'S': 'Semi-detached',
-        'T': 'Terraced',
-        'F': 'Flat/Maisonette',
-        'O': 'Other'
-    }
-    property_data['property_type_name'] = property_type_map.get(property_data['property_type'], 'Unknown')
-    
-    # Set reasonable defaults for missing data
-    if property_data['bedrooms'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['bedrooms'] = 2
-        else:
-            property_data['bedrooms'] = 3
-    
-    if property_data['bathrooms'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['bathrooms'] = 1
-        else:
-            property_data['bathrooms'] = 1.5
-    
-    if property_data['sq_ft'] is None:
-        if property_data['property_type'] == 'F':
-            property_data['sq_ft'] = 750
-        elif property_data['property_type'] == 'T':
-            property_data['sq_ft'] = 1000
-        elif property_data['property_type'] == 'S':
-            property_data['sq_ft'] = 1200
-        elif property_data['property_type'] == 'D':
-            property_data['sq_ft'] = 1500
-        else:
-            property_data['sq_ft'] = 1000
-    
-    # Calculate price per sq ft
-    try:
-        property_data['price_per_sqft'] = property_data['estimated_value'] / property_data['sq_ft']
-    except (TypeError, ZeroDivisionError):
-        property_data['price_per_sqft'] = 300  # Default value
-    
-    # Add some property features based on property type
-    if property_data['property_type'] == 'D':
-        property_data['features'] = ['Garden', 'Driveway', 'Garage']
-    elif property_data['property_type'] == 'S':
-        property_data['features'] = ['Garden', 'Driveway']
-    elif property_data['property_type'] == 'T':
-        property_data['features'] = ['Garden']
-    elif property_data['property_type'] == 'F':
-        property_data['features'] = ['Communal Garden', 'Parking']
-    
-    return property_data
-    
 def predict_rental_growth(rental_data):
-    """Predict future rental growth using Prophet or fallback method"""
-    if PROPHET_AVAILABLE and rental_data.get('growth_rate') is not None:
-        # Use Prophet for sophisticated forecasting
-        # This would be based on historical data, which we don't fully have now
-        # For now, we'll use a simplified approach
-        current_rent = rental_data['monthly_rent']
-        growth_rate = rental_data['growth_rate'] / 100  # Convert percentage to decimal
-        
-        forecast = []
-        for year in range(1, 6):
-            forecast.append({
-                'year': year,
-                'monthly_rent': current_rent * (1 + growth_rate) ** year,
-                'annual_rent': current_rent * 12 * (1 + growth_rate) ** year
-            })
-    else:
-        # Fallback to simple projection
-        current_rent = rental_data['monthly_rent']
-        # Use average UK rental growth of 3% if we don't have actual data
-        growth_rate = rental_data.get('growth_rate', 3) / 100
-        
-        forecast = []
-        for year in range(1, 6):
-            forecast.append({
-                'year': year,
-                'monthly_rent': current_rent * (1 + growth_rate) ** year,
-                'annual_rent': current_rent * 12 * (1 + growth_rate) ** year
-            })
+    """Predict future rental growth using simple projection"""
+    current_rent = rental_data['monthly_rent']
+    # Use rental growth rate if available, otherwise default to 3%
+    growth_rate = rental_data.get('growth_rate', 3) / 100
+    
+    forecast = []
+    for year in range(1, 6):
+        forecast.append({
+            'year': year,
+            'monthly_rent': current_rent * (1 + growth_rate) ** year,
+            'annual_rent': current_rent * 12 * (1 + growth_rate) ** year
+        })
     
     return forecast
 
-def generate_llama_insights(property_data, rental_data, area_data, location_info, btr_score):
-    """Generate market insights using Llama 3 (if available)"""
-    if not OLLAMA_AVAILABLE:
-        # Fallback to predefined insights
-        return {
-            "investment_advice": "This property presents a solid Buy-to-Rent opportunity with potential for good rental yield and moderate capital appreciation. The area has stable demand from renters and property values have shown consistent growth.",
-            "market_commentary": "The UK rental market continues to show strong demand, particularly in areas with good transport links and amenities. Rental growth has outpaced inflation in recent years, making BTR an attractive investment option.",
-            "renovation_advice": "Consider focusing on kitchen and bathroom upgrades which typically offer the best return on investment for rental properties. Energy efficiency improvements can also help attract quality tenants and comply with upcoming EPC regulations."
-        }
+def generate_ai_insights(property_data, rental_data, area_data, location_info, btr_score):
+    """Generate market insights using AI"""
+    # Check cache first
+    cache_key = location_info.get('postcode') or location_info.get('formatted_address')
+    if cache_key:
+        cached_data = get_cached_data(cache_key, 'insights')
+        if cached_data:
+            return cached_data
     
-    # Format data for Llama
-    prompt = f"""
-    You are a property investment expert specializing in Buy-to-Rent (BTR) investments in the UK.
-    Please provide expert insights on the following property:
-    
-    PROPERTY DETAILS:
-    - Location: {location_info.get('formatted_address', 'Unknown')}
-    - Property Type: {property_data['property_type_name']}
-    - Bedrooms: {property_data['bedrooms']}
-    - Bathrooms: {property_data['bathrooms']}
-    - Size: {property_data['sq_ft']} sq ft
-    - Estimated Value: £{property_data['estimated_value']:,.0f}
-    - BTR Score: {btr_score['overall_score']}/100 ({btr_score['category'].replace('_', ' ').title()})
-    
-    RENTAL INFORMATION:
-    - Estimated Monthly Rent: £{rental_data['monthly_rent']:,.0f}
-    - Gross Yield: {(rental_data['annual_rent'] / property_data['estimated_value']) * 100:.2f}%
-    - Rental Growth Rate: {rental_data.get('growth_rate', 3):.1f}%
-    
-    AREA INFORMATION:
-    - Crime Rate: {area_data['crime_rate']}
-    - School Rating: {area_data['school_rating']}
-    - Transport Links: {area_data['transport_links']}
-    - Key Amenities: {', '.join([item for sublist in list(area_data['amenities'].values()) for item in sublist][:5])}
-    
-    Based on this information, please provide:
-    1. Investment Advice (2-3 sentences about whether this is a good BTR opportunity)
-    2. Market Commentary (2-3 sentences about the current BTR market conditions in this area)
-    3. Renovation Advice (2-3 sentences about the best renovation approach for this property)
-    
-    Format your response as JSON with the keys "investment_advice", "market_commentary", and "renovation_advice".
-    """
-    
-    try:
-        # Call Llama 3 via Ollama
-        response = ollama.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
-        
-        # Extract content
-        content = response['message']['content']
-        
-        # Try to parse JSON from the response
-        # Find JSON content between ```json and ``` if present
-        json_match = re.search(r'```json\n(.*?)\n```', content, re.DOTALL)
-        if json_match:
-            json_content = json_match.group(1)
-        else:
-            # Assume the entire response is JSON
-            json_content = content
-        
+    # Use Llama 3 if available, otherwise use pre-defined insights
+    if OLLAMA_AVAILABLE:
         try:
-            insights = json.loads(json_content)
-            # Ensure all required keys are present
-            required_keys = ["investment_advice", "market_commentary", "renovation_advice"]
-            for key in required_keys:
-                if key not in insights:
-                    insights[key] = "Analysis not available."
-            return insights
-        except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
-            return {
-                "investment_advice": "This property appears to be a reasonable BTR investment opportunity based on its characteristics and location.",
-                "market_commentary": "The current market shows steady demand for rental properties in this area.",
-                "renovation_advice": "Focus on cost-effective improvements that enhance rental appeal and value."
-            }
-    except Exception as e:
-        print(f"Error generating Llama insights: {e}")
-        return {
-            "investment_advice": "This property presents a potential BTR opportunity worth further investigation.",
-            "market_commentary": "The current rental market is experiencing stable demand with moderate growth projections.",
-            "renovation_advice": "Consider targeted renovations to improve rental yield while maintaining a good return on investment."
-        }
+            # Format data for Llama
+            prompt = f"""
+            You are a property investment expert specializing in Buy-to-Rent (BTR) investments in the UK.
+            Please provide expert insights on the following property:
+            
+            PROPERTY DETAILS:
+            - Location: {location_info.get('formatted_address', 'Unknown')}
+            - Property Type: {property_data['property_type_name']}
+            - Bedrooms: {property_data['bedrooms']}
+            - Bathrooms: {property_data['bathrooms']}
+            - Size: {property_data['sq_ft']} sq ft
+            - Estimated Value: £{property_data['estimated_value']:,.0f}
+            - BTR Score: {btr_score['overall_score']}/100 ({btr_score['category'].replace('_', ' ').title()})
+            
+            RENTAL INFORMATION:
+            - Estimated Monthly Rent: £{rental_data['monthly_rent']:,.0f}
+            - Gross Yield: {(rental_data['annual_rent'] / property_data['estimated_value']) * 100:.2f}%
+            - Rental Growth Rate: {rental_data.get('growth_rate', 3):.1f}%
+            
+            AREA INFORMATION:
+            - Crime Rate: {area_data['crime_rate']}
+            - School Rating: {area_data['school_rating']}
+            - Transport Links: {area_data['transport_links']}
+            - Key Amenities: {', '.join([item for sublist in list(area_data['amenities'].values()) for item in sublist][:5])}
+            
+            Based on this information, please provide:
+            1. Investment Advice (2-3 sentences about whether this is a good BTR opportunity)
+            2. Market Commentary (2-3 sentences about the current BTR market conditions in this area)
+            3. Renovation Advice (2-3 sentences about the best renovation approach for this property)
+            
+            Format your response as JSON with the keys "investment_advice", "market_commentary", and "renovation_advice".
+            """
+            
+            # Call Llama 3 via Ollama
+            response = ollama.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+            
+            # Extract content
+            content = response['message']['content']
+            
+            # Try to parse JSON from the response
+            # Find JSON content between ```json and ``` if present
+            json_match = re.search(r'```json\n(.*?)\n```', content, re.DOTALL)
+            if json_match:
+                json_content = json_match.group(1)
+            else:
+                # Assume the entire response is JSON
+                json_content = content
+            
+            try:
+                insights = json.loads(json_content)
+                # Ensure all required keys are present
+                required_keys = ["investment_advice", "market_commentary", "renovation_advice"]
+                for key in required_keys:
+                    if key not in insights:
+                        insights[key] = "Analysis not available."
+                
+                # Add data quality indicator
+                insights['data_quality'] = 'ai_generated'
+                
+                # Cache the insights
+                if cache_key:
+                    save_to_cache(cache_key, 'insights', insights)
+                
+                return insights
+            except json.JSONDecodeError:
+                # Fallback if JSON parsing fails
+                pass
+        except Exception as e:
+            print(f"Error generating AI insights: {e}")
+    
+    # Fallback to pre-defined insights
+    property_type = property_data['property_type_name'].lower()
+    location = location_info.get('formatted_address', '').lower()
+    score_category = btr_score['category']
+    
+    # Generate insights based on data
+    if score_category in ['excellent', 'good', 'above_average']:
+        investment_advice = f"This {property_type} presents a strong Buy-to-Rent opportunity with a {btr_score['overall_score']}/100 score. With an estimated yield of {(rental_data['annual_rent'] / property_data['estimated_value']) * 100:.1f}%, it offers attractive returns in a stable rental market."
+    else:
+        investment_advice = f"This {property_type} presents a moderate Buy-to-Rent opportunity with some limitations. The {btr_score['overall_score']}/100 score indicates potential challenges, but strategic improvements could enhance its rental performance."
+    
+    # Market commentary based on location
+    if any(city in location for city in ['london', 'manchester', 'birmingham', 'leeds', 'bristol']):
+        market_commentary = f"The rental market in {location_info.get('city', 'this area')} remains robust with strong tenant demand, particularly for well-maintained properties. Rental growth of approximately {rental_data.get('growth_rate', 3):.1f}% is projected, outpacing inflation and supporting buy-to-rent investments."
+    else:
+        market_commentary = f"The rental market in {location_info.get('city', 'this area')} shows stable demand with moderate growth projections. With expected rental increases of {rental_data.get('growth_rate', 3):.1f}% annually, carefully selected properties can provide sustainable investment returns."
+    
+    # Renovation advice based on property type
+    if property_data['property_type'] == 'F':  # Flat
+        renovation_advice = "Focus on modernizing kitchen and bathroom areas which typically offer the highest return on investment for flats. Consider energy efficiency improvements to meet upcoming EPC regulations and attract quality tenants willing to pay premium rents."
+    else:  # Houses
+        renovation_advice = "Consider adding value through strategic improvements like kitchen modernization, bathroom upgrades, and potentially a loft conversion or extension if permitted. Energy efficiency upgrades will future-proof the investment against upcoming regulations while appealing to environmentally-conscious tenants."
+    
+    insights = {
+        "investment_advice": investment_advice,
+        "market_commentary": market_commentary,
+        "renovation_advice": renovation_advice,
+        "data_quality": "estimated"
+    }
+    
+    # Cache the insights
+    if cache_key:
+        save_to_cache(cache_key, 'insights', insights)
+    
+    return insights
 
-def generate_pdf_report(property_data, rental_data, area_data, location_info, btr_score, renovation_scenarios, rental_forecast, llama_insights):
+def generate_pdf_report(property_data, rental_data, area_data, location_info, btr_score, renovation_scenarios, rental_forecast, ai_insights):
     """Generate a PDF report for the property"""
     # Create a temporary file
     temp_file = os.path.join(tempfile.gettempdir(), f"btr_report_{uuid.uuid4()}.pdf")
@@ -794,11 +724,10 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
     elements.append(Paragraph("The BTR Potential of", title_style))
     address = location_info.get('formatted_address', 'Unknown Address')
     elements.append(Paragraph(f"{address} is", title_style))
-    elements.append(Paragraph(f"<font color={ACCENT_COLOR}>{btr_score['category'].replace('_', ' ')}.</font>", title_style))
+    elements.append(Paragraph(f"<font color='{ACCENT_COLOR}'>{btr_score['category'].replace('_', ' ')}.</font>", title_style))
     elements.append(Spacer(1, 12))
     
     # Property details and value
-    # Current property specs
     specs_data = [
         ["Current Specs", "Estimated Value"],
         [
@@ -841,14 +770,14 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
     elements.append(Paragraph(score_desc, normal_style))
     elements.append(Spacer(1, 6))
     
-    # Investment advice from Llama
+    # Investment advice from AI
     elements.append(Paragraph("Investment Advice", subheading_style))
-    elements.append(Paragraph(llama_insights['investment_advice'], normal_style))
+    elements.append(Paragraph(ai_insights['investment_advice'], normal_style))
     elements.append(Spacer(1, 6))
     
     # Market commentary
     elements.append(Paragraph("Market Commentary", subheading_style))
-    elements.append(Paragraph(llama_insights['market_commentary'], normal_style))
+    elements.append(Paragraph(ai_insights['market_commentary'], normal_style))
     elements.append(Spacer(1, 12))
     
     # Renovation scenarios
@@ -887,7 +816,7 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
     
     # Renovation advice
     elements.append(Paragraph("Renovation Advice", subheading_style))
-    elements.append(Paragraph(llama_insights['renovation_advice'], normal_style))
+    elements.append(Paragraph(ai_insights['renovation_advice'], normal_style))
     elements.append(Spacer(1, 12))
     
     # Rental forecast
@@ -988,6 +917,29 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
     elements.append(area_table)
     elements.append(Spacer(1, 12))
     
+    # Data Quality Notice
+    data_notice = "Note on data sources: "
+    if property_data.get('data_quality') == 'verified':
+        data_notice += "Property data is verified from Land Registry records. "
+    else:
+        data_notice += "Property data is estimated based on location and property characteristics. "
+        
+    if rental_data.get('data_quality') == 'verified':
+        data_notice += "Rental data is verified from ONS statistics. "
+    else:
+        data_notice += "Rental data is estimated based on typical yields for similar properties. "
+    
+    if ai_insights.get('data_quality') == 'ai_generated':
+        data_notice += "Market insights are generated using AI analysis."
+    
+    elements.append(Paragraph(data_notice, ParagraphStyle(
+        'Notice',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=colors.darkgray
+    )))
+    elements.append(Spacer(1, 6))
+    
     # Disclaimer
     disclaimer_text = "The accuracy of this BTR report and its applicability to your circumstances are not guaranteed. "
     disclaimer_text += "This report is offered for educational purposes only, and is not a substitute for professional advice. "
@@ -1008,16 +960,12 @@ def generate_pdf_report(property_data, rental_data, area_data, location_info, bt
 # Streamlit UI for BTR Report Generator
 def display_btr_report_generator():
     """Display the BTR Report Generator interface"""
-    data_files = os.listdir('data/processed') if os.path.exists('data/processed') else []
+    # Check if data directories exist (create if not)
+    os.makedirs('data/processed', exist_ok=True)
+    os.makedirs('data/raw', exist_ok=True)
+    os.makedirs('data/cache', exist_ok=True)
     
-    if not data_files:
-        st.warning("""
-        Limited data files detected. The BTR Report Generator will use estimated values for many calculations.
-        For best results, run the data collection script:
-        ```
-        python scripts/run_data_collection.py --run-now
-        ```
-        """)
+    # Set up UI styling
     st.markdown(
         """
         <style>
@@ -1042,6 +990,24 @@ def display_btr_report_generator():
             padding: 20px;
             border-radius: 10px;
             margin-bottom: 20px;
+        }
+        .data-quality-indicator {
+            font-size: 0.8rem;
+            padding: 2px 5px;
+            border-radius: 3px;
+            margin-left: 5px;
+        }
+        .verified {
+            background-color: #c8e6c9;
+            color: #2e7d32;
+        }
+        .estimated {
+            background-color: #fff9c4;
+            color: #f57f17;
+        }
+        .ai-generated {
+            background-color: #e1f5fe;
+            color: #0288d1;
         }
         </style>
         """, 
@@ -1079,45 +1045,72 @@ def display_btr_report_generator():
                 location_info = geocode_uk_address(address_input)
                 
                 if location_info:
+                    # Show progress updates
+                    progress_container = st.empty()
+                    progress_container.info("Gathering property data...")
+                    
                     # 2. Fetch property data
                     property_data = fetch_property_data(
                         postcode=location_info.get('postcode'),
-                        address=location_info.get('formatted_address')
+                        address=location_info.get('formatted_address'),
+                        location_info=location_info
                     )
+                    
+                    progress_container.info("Analyzing rental potential...")
                     
                     # 3. Fetch rental data
                     rental_data = fetch_rental_data(
                         postcode=location_info.get('postcode'),
                         property_type=property_data['property_type'],
-                        bedrooms=property_data['bedrooms']
+                        bedrooms=property_data['bedrooms'],
+                        location_info=location_info,
+                        property_data=property_data
                     )
                     
-                    # Calculate gross yield
-                    if property_data['estimated_value'] > 0:
-                        rental_data['gross_yield'] = rental_data['annual_rent'] / property_data['estimated_value']
-                    else:
-                        rental_data['gross_yield'] = 0.05  # Default 5%
+                    progress_container.info("Researching area information...")
                     
                     # 4. Fetch area data
                     area_data = fetch_area_data(location_info)
                     
+                    progress_container.info("Calculating BTR score...")
+                    
                     # 5. Calculate BTR score
                     btr_score = calculate_btr_score(property_data, rental_data, area_data, location_info)
+                    
+                    progress_container.info("Creating renovation scenarios...")
                     
                     # 6. Calculate renovation scenarios
                     renovation_scenarios = calculate_renovation_scenarios(property_data)
                     
+                    progress_container.info("Forecasting rental growth...")
+                    
                     # 7. Predict rental growth
                     rental_forecast = predict_rental_growth(rental_data)
                     
-                    # 8. Generate Llama insights
-                    llama_insights = generate_llama_insights(property_data, rental_data, area_data, location_info, btr_score)
+                    progress_container.info("Generating AI investment insights...")
                     
-                    # 9. Generate PDF report
+                    # 8. Generate AI insights
+                    ai_insights = generate_ai_insights(property_data, rental_data, area_data, location_info, btr_score)
+                    
+                    # 9. Add data quality indicators
+                    report_data = {
+                        'property': property_data,
+                        'rental': rental_data,
+                        'area': area_data,
+                        'ai_insights': ai_insights
+                    }
+                    report_data = add_data_quality_indicators(report_data)
+                    
+                    progress_container.info("Generating PDF report...")
+                    
+                    # 10. Generate PDF report
                     pdf_path = generate_pdf_report(
                         property_data, rental_data, area_data, location_info, 
-                        btr_score, renovation_scenarios, rental_forecast, llama_insights
+                        btr_score, renovation_scenarios, rental_forecast, ai_insights
                     )
+                    
+                    # Clear progress container
+                    progress_container.empty()
                     
                     # Display report summary
                     st.markdown("<div class='report-header'>", unsafe_allow_html=True)
@@ -1136,6 +1129,13 @@ def display_btr_report_generator():
                     
                     with col1:
                         st.subheader("Current Specs")
+                        
+                        # Add data quality indicator
+                        quality_class = property_data.get('data_quality', 'estimated')
+                        quality_indicator = "✓" if quality_class == 'verified' else "≈"
+                        
+                        st.markdown(f"<div>Property Data {quality_indicator} <span class='data-quality-indicator {quality_class}'>{quality_class}</span></div>", unsafe_allow_html=True)
+                        
                         st.write(f"{property_data['bedrooms']} Bed / {property_data['bathrooms']} Bath")
                         st.write(f"{property_data['sq_ft']} sqft")
                         st.write(f"£{property_data['price_per_sqft']:.0f} per sqft")
@@ -1172,14 +1172,20 @@ def display_btr_report_generator():
                     # Expert insights section
                     st.subheader("Expert Insights")
                     
+                    # Add data quality indicator
+                    quality_class = ai_insights.get('data_quality', 'estimated')
+                    quality_indicator = "🤖" if quality_class == 'ai_generated' else "≈"
+                    
+                    st.markdown(f"<div>Insights {quality_indicator} <span class='data-quality-indicator {quality_class}'>{quality_class}</span></div>", unsafe_allow_html=True)
+                    
                     with st.expander("Investment Advice", expanded=True):
-                        st.write(llama_insights['investment_advice'])
+                        st.write(ai_insights['investment_advice'])
                     
                     with st.expander("Market Commentary", expanded=True):
-                        st.write(llama_insights['market_commentary'])
+                        st.write(ai_insights['market_commentary'])
                     
                     with st.expander("Renovation Advice", expanded=True):
-                        st.write(llama_insights['renovation_advice'])
+                        st.write(ai_insights['renovation_advice'])
                     
                     # Renovation scenarios section
                     st.subheader("Renovation Scenarios")
@@ -1200,6 +1206,12 @@ def display_btr_report_generator():
                     # Rental projection section
                     st.subheader("Rental Forecast")
                     
+                    # Add data quality indicator
+                    quality_class = rental_data.get('data_quality', 'estimated')
+                    quality_indicator = "✓" if quality_class == 'verified' else "≈"
+                    
+                    st.markdown(f"<div>Rental Data {quality_indicator} <span class='data-quality-indicator {quality_class}'>{quality_class}</span></div>", unsafe_allow_html=True)
+                    
                     # Create data for chart
                     forecast_df = pd.DataFrame({
                         'Year': ['Current'] + [f"Year {year['year']}" for year in rental_forecast],
@@ -1219,6 +1231,12 @@ def display_btr_report_generator():
                     
                     # Area overview section
                     st.subheader("Area Overview")
+                    
+                    # Add data quality indicator
+                    quality_class = area_data.get('data_quality', 'estimated')
+                    quality_indicator = "✓" if quality_class == 'verified' else "≈"
+                    
+                    st.markdown(f"<div>Area Data {quality_indicator} <span class='data-quality-indicator {quality_class}'>{quality_class}</span></div>", unsafe_allow_html=True)
                     
                     # Create a simple map
                     if 'lat' in location_info and 'lon' in location_info:
@@ -1272,12 +1290,19 @@ def display_btr_report_generator():
                             mime="application/pdf"
                         )
                     
+                    # Show data source notice
+                    st.markdown("---")
+                    st.caption("**Data Sources:** This report combines verified data where available with estimations based on property characteristics, location, and market trends. The BTR score and recommendations are calculated using proprietary algorithms.")
+                    
                     # Button to generate a new report
-                    st.button("Generate Another Report", on_click=lambda: st.experimental_rerun())
+                    if st.button("Generate Another Report"):
+                        st.experimental_rerun()
                 else:
                     st.error("Could not find location information for the provided address. Please try a different address or format.")
             except Exception as e:
                 st.error(f"An error occurred while generating the report: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
     
     # Bottom section - What's next
     if not (generate_button and address_input):
@@ -1295,46 +1320,15 @@ def display_btr_report_generator():
         
         Simply enter a UK property address or postcode above and click "GENERATE" to get your free report.
         """)
-
-# Main app
-def main():
-    st.set_page_config(
-        page_title="BTR Investment Report Generator",
-        page_icon="🏘️",
-        layout="wide"
-    )
-    
-    # Create sidebar navigation
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
-        "Select a page",
-        ["BTR Report Generator", "BTR Hotspot Map", "Investment Calculator", "Data Explorer"]
-    )
-    
-    # Display the selected page
-    if page == "BTR Report Generator":
-        display_btr_report_generator()
-    elif page == "BTR Hotspot Map":
-        # Import and use the existing map function if available
-        try:
-            from src.components.mapping_util import display_btr_map
-            display_btr_map()
-        except ImportError:
-            st.write("BTR Hotspot Map is not available. Please check back later.")
-    elif page == "Investment Calculator":
-        # Import and use the existing calculator if available
-        try:
-            from src.components.investment_calculator_page import display_investment_calculator
-            display_investment_calculator()
-        except ImportError:
-            st.write("Investment Calculator is not available. Please check back later.")
-    elif page == "Data Explorer":
-        # Import and use the existing data dashboard if available
-        try:
-            from src.components.data_dashboard import display_data_dashboard
-            display_data_dashboard()
-        except ImportError:
-            st.write("Data Explorer is not available. Please check back later.")
-
-if __name__ == "__main__":
-    main()
+        
+        # Show sample properties
+        st.subheader("Try these example addresses:")
+        example_col1, example_col2 = st.columns(2)
+        
+        with example_col1:
+            st.markdown("- 42 Abbey Road, London NW8")
+            st.markdown("- 15 Victoria Street, Manchester M3")
+        
+        with example_col2:
+            st.markdown("- 27 The Promenade, Cheltenham GL50")
+            st.markdown("- 8 Royal Mile, Edinburgh EH1")
